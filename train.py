@@ -16,13 +16,115 @@ from tqdm import tqdm
 import wandb
 from evaluate import evaluate
 from unet import UNet
-from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
 
-dir_img = Path('./data/imgs/')
+
+dir_img = Path('../complex_dataset/')
 dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
+import torch
+from torch.utils.data import Dataset, Sampler
+from PIL import Image
+import numpy as np
+import random
+import os
+import cv2
+
+from abc import abstractmethod
+import torchvision.transforms as transforms
+import torch
+from skimage.transform import resize
+import numpy as np
+from batchgenerators.augmentations.utils import resize_segmentation
+
+class ResizeImg():
+    def __init__(self, new_shape):
+        self.new_shape = new_shape
+    def __call__(self, img):
+        new_shape = (self.new_shape, self.new_shape)
+        img = resize(img, new_shape, 3, cval=0, mode='edge', anti_aliasing=False)
+        return img
+
+class ResizeMsk():
+    def __init__(self, new_shape):
+        self.new_shape = new_shape
+    def __call__(self, msk):
+        new_shape = (self.new_shape, self.new_shape, msk.shape[-1])
+        msk = resize_segmentation(msk, new_shape, order=1)
+        return msk
+
+class TransformsConfig(object):
+
+    def __init__(self, opts):
+        self.opts = opts
+
+    @abstractmethod
+    def get_transforms(self):
+        pass
+
+def one_hot(seg, num_classes=2):
+    return np.eye(num_classes)[np.rint(seg).astype(int)].astype(np.float32)
+
+def unsqueeze_msk(msk, num_classes=3):
+    new_msk = np.zeros((3, msk.shape[0], msk.shape[1]))
+
+    new_msk[0][msk == 2] = 1
+    new_msk[1][msk == 1] = 1
+    new_msk[2][msk == 3] = 1
+
+    return new_msk
+
+
+class ImagesDataset(Dataset):
+
+    def __init__(self, source_root):
+        self.source_root = source_root
+        self.items = [np.load(os.path.join(source_root, img_path), allow_pickle=True) for img_path in os.listdir(source_root)]
+        self.source_transform = transforms.Compose([
+                ResizeImg(64),
+                transforms.ToTensor()
+            ])
+        self.target_transform = transforms.Compose([
+                ResizeMsk(64),
+                transforms.ToTensor()
+            ])
+
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        
+        sample = self.items[index]
+        img, msk = sample["img"], sample["msk"]
+        
+        if len(img.shape) == 2:  # Grayscale image
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif img.shape[2] == 1:  # Single channel image
+            img = cv2.cvtColor(np.squeeze(img), cv2.COLOR_GRAY2RGB)
+        else:  # Already an RGB image
+            img = img
+
+        img = img.astype(float)/127.5 - 1
+
+        small_img = self.source_transform(img)
+        
+        msk = unsqueeze_msk(msk)
+        msk = np.moveaxis(msk, 0, -1)
+        msk = self.target_transform(msk)
+
+        print(msk.shape)
+        msk = msk.squeeze(0)
+        print(msk.shape)
+        assert False
+
+        return {
+            'image': torch.as_tensor(small_img).float().contiguous(),
+            'mask': torch.as_tensor(msk).float().contiguous()
+        }
+        
+    
 
 def train_model(
         model,
@@ -39,11 +141,8 @@ def train_model(
         gradient_clipping: float = 1.0,
 ):
     # 1. Create dataset
-    try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
-    except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
-
+    dataset = ImagesDataset(dir_img)
+    
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
     n_train = len(dataset) - n_val
@@ -103,7 +202,7 @@ def train_model(
                         loss = criterion(masks_pred.squeeze(1), true_masks.float())
                         loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
                     else:
-                        loss = criterion(masks_pred, true_masks)
+                        loss = criterion(masks_pred.float(), true_masks.float())
                         loss += dice_loss(
                             F.softmax(masks_pred, dim=1).float(),
                             F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
@@ -179,7 +278,7 @@ def get_args():
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--classes', '-c', type=int, default=3, help='Number of classes')
 
     return parser.parse_args()
 
